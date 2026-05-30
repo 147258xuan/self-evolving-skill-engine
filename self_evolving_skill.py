@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import csv
 import uuid
 import hashlib
 import copy
@@ -669,8 +670,150 @@ class SelfEvolvingSkillEngine:
         return report
 
 
+# ==========================================  [新增] Benchmark 系统  # ==========================================
+
+class BenchmarkScorer:
+    """评分器：比较预测结果和标准答案"""
+
+    @staticmethod
+    def exact_match(predicted: str, expected: str) -> float:
+        """精确匹配（忽略大小写和首尾空格）"""
+        return 1.0 if predicted.strip().lower() == expected.strip().lower() else 0.0
+
+    @staticmethod
+    def contains_match(predicted: str, expected: str) -> float:
+        """包含匹配（预测结果包含标准答案）"""
+        return 1.0 if expected.strip().lower() in predicted.strip().lower() else 0.0
+
+    @staticmethod
+    def numeric_tolerance(predicted: str, expected: str, tolerance: float = 0.05) -> float:
+        """数值容差匹配（±5%）"""
+        try:
+            pred_num = float(''.join(c for c in predicted if c.isdigit() or c in '.-'))
+            exp_num = float(''.join(c for c in expected if c.isdigit() or c in '.-'))
+            if exp_num == 0:
+                return 1.0 if pred_num == 0 else 0.0
+            return 1.0 if abs(pred_num - exp_num) / abs(exp_num) <= tolerance else 0.0
+        except (ValueError, ZeroDivisionError):
+            return 0.0
+
+    @staticmethod
+    def llm_judge(predicted: str, expected: str, rubric: str = "") -> float:
+        """LLM-as-judge 评分"""
+        if not rubric:
+            rubric = "判断预测答案是否正确。只输出 1（正确）或 0（错误）。"
+        prompt = f"标准答案: {expected}\n预测答案: {predicted}\n评分标准: {rubric}\n\n只输出 1 或 0:"
+        try:
+            resp = call_llm("你是一个严格的评分员。", prompt)
+            return 1.0 if "1" in resp.strip() else 0.0
+        except Exception:
+            return BenchmarkScorer.exact_match(predicted, expected)
+
+
+class BenchmarkDataset:
+    """加载测试数据集（支持 JSON 和 CSV）"""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.cases: List[dict] = []
+        self._load()
+
+    def _load(self):
+        if self.path.suffix == ".json":
+            with open(self.path, "r", encoding="utf-8") as f:
+                self.cases = json.load(f)
+        elif self.path.suffix == ".csv":
+            import csv
+            with open(self.path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                self.cases = list(reader)
+        else:
+            raise ValueError(f"不支持的格式: {self.path.suffix}")
+        print(f"📂 加载 benchmark 数据集: {len(self.cases)} 条测试用例")
+
+    def split(self, train_ratio: float = 0.7) -> tuple:
+        """拆分训练集和验证集"""
+        split_idx = int(len(self.cases) * train_ratio)
+        return self.cases[:split_idx], self.cases[split_idx:]
+
+
+class BenchmarkRunner:
+    """运行 benchmark 并跟踪进化历史"""
+
+    def __init__(self, dataset: BenchmarkDataset, scorer_type: str = "exact"):
+        self.dataset = dataset
+        self.scorer_type = scorer_type
+        self.history: List[dict] = []  # 每次迭代的准确率
+
+    def run(self, predict_fn, cases: Optional[List[dict]] = None) -> dict:
+        """
+        运行一轮 benchmark。
+        predict_fn: 函数，输入 question 字符串，输出预测答案字符串
+        返回: {accuracy, total, passed, failed_cases, all_results}
+        """
+        if cases is None:
+            cases = self.dataset.cases
+
+        results = []
+        for case in cases:
+            question = case.get("question", case.get("input", ""))
+            expected = case.get("answer", case.get("expected", case.get("ground_truth", "")))
+
+            try:
+                predicted = predict_fn(question)
+            except Exception as e:
+                results.append({"question": question, "expected": expected, "predicted": "", "score": 0.0, "error": str(e)})
+                continue
+
+            score = self._score(str(predicted), str(expected))
+            results.append({"question": question, "expected": expected, "predicted": str(predicted), "score": score})
+
+        accuracy = sum(r["score"] for r in results) / len(results) if results else 0.0
+        failed = [r for r in results if r["score"] < 1.0]
+
+        iteration = len(self.history) + 1
+        self.history.append({
+            "iteration": iteration,
+            "accuracy": accuracy,
+            "total": len(results),
+            "passed": len(results) - len(failed),
+            "failed": len(failed),
+            "timestamp": datetime.now().isoformat(),
+        })
+
+        return {"accuracy": accuracy, "total": len(results), "passed": len(results) - len(failed), "failed_cases": failed, "all_results": results}
+
+    def _score(self, predicted: str, expected: str) -> float:
+        scorers = {
+            "exact": BenchmarkScorer.exact_match,
+            "contains": BenchmarkScorer.contains_match,
+            "numeric": BenchmarkScorer.numeric_tolerance,
+            "llm": BenchmarkScorer.llm_judge,
+        }
+        return scorers.get(self.scorer_type, BenchmarkScorer.exact_match)(predicted, expected)
+
+    def get_frontier(self) -> dict:
+        """获取历史最佳"""
+        if not self.history:
+            return {"accuracy": 0.0, "iteration": 0}
+        return max(self.history, key=lambda x: x["accuracy"])
+
+    def print_progress(self):
+        """打印进度表（类似 EvoSkill）"""
+        if not self.history:
+            return
+        print(f"\n {'Iter':<6} {'Accuracy':<10} {'Delta':<8} {'Passed':<8} {'Frontier':<10} {'Status'}")
+        print(" " + "-" * 55)
+        frontier_acc = self.get_frontier()["accuracy"]
+        for h in self.history:
+            delta = h["accuracy"] - self.history[h["iteration"] - 2]["accuracy"] if h["iteration"] > 1 else 0
+            is_frontier = h["accuracy"] >= frontier_acc
+            status = "★ best" if is_frontier and h["iteration"] > 1 else ("baseline" if h["iteration"] == 1 else "")
+            print(f" {h['iteration']:<6} {h['accuracy']:<10.1%} {delta:<+8.1%} {h['passed']}/{h['total']:<6} {frontier_acc:<10.1%} {status}")
+
+
 # ==========================================
-# 3. 运行演示 — 代码 Bug 自动修复 & 技能生成
+# 3. 运行演示 — 代码 Bug 自动修复 & 技能生成 & Benchmark
 # ==========================================
 
 if __name__ == "__main__":
@@ -681,6 +824,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print("场景1: 代码 Bug 自动修复")
     print("场景2: 技能生成 & 进化")
+    print("场景3: Benchmark 驱动进化")
     print("=" * 60)
 
     # ========================================
@@ -817,6 +961,99 @@ if __name__ == "__main__":
         for entry in api_skill.dynamic_error_appendix:
             entry.hit_count = 5  # 模拟命中次数
         engine.check_promotion_threshold(api_skill)
+
+    # ========================================
+    # 场景3: Benchmark 驱动进化
+    # ========================================
+    print("\n" + "-" * 60)
+    print("📝 场景3: Benchmark 驱动进化")
+    print("-" * 60)
+
+    # 3.1 加载 benchmark 数据集
+    benchmark_path = Path(__file__).parent / "benchmark_questions.json"
+    if benchmark_path.exists():
+        dataset = BenchmarkDataset(benchmark_path)
+        train_cases, val_cases = dataset.split(train_ratio=0.7)
+        print(f"   训练集: {len(train_cases)} 条 | 验证集: {len(val_cases)} 条")
+
+        # 3.2 创建 benchmark runner
+        runner = BenchmarkRunner(dataset, scorer_type="contains")
+
+        # 3.3 模拟 Agent 回答（第一轮：基础能力，60% 准确率）
+        def agent_v1(question: str) -> str:
+            """v1: 只能回答简单问题"""
+            simple_answers = {
+                "反转列表": "list.reverse()",
+                "读取 JSON": "json.load()",
+                "捕获异常": "except Exception",
+                "虚拟环境": "python -m venv",
+                "格式化字符串": "f-string",
+            }
+            for key, ans in simple_answers.items():
+                if key in question:
+                    return ans
+            return "不知道"
+
+        print("\n🔄 迭代 1: Agent v1 (基础能力)")
+        result1 = runner.run(agent_v1, train_cases)
+        runner.print_progress()
+        print(f"   失败案例: {[r['question'][:20] for r in result1['failed_cases']]}")
+
+        # 3.4 模拟进化：Agent v2 学会了更多
+        def agent_v2(question: str) -> str:
+            """v2: 修复了排序和类型检查"""
+            answers = {
+                "反转列表": "list.reverse()",
+                "读取 JSON": "json.load()",
+                "捕获异常": "except Exception",
+                "虚拟环境": "python -m venv",
+                "格式化字符串": "f-string",
+                "排序字典": "sorted()",
+                "检查类型": "isinstance()",
+            }
+            for key, ans in answers.items():
+                if key in question:
+                    return ans
+            return "不知道"
+
+        print("\n🔄 迭代 2: Agent v2 (修复了排序和类型检查)")
+        result2 = runner.run(agent_v2, train_cases)
+        runner.print_progress()
+
+        # 3.5 模拟进化：Agent v3 进一步提升
+        def agent_v3(question: str) -> str:
+            """v3: 几乎全对"""
+            answers = {
+                "反转列表": "list.reverse()",
+                "读取 JSON": "json.load()",
+                "捕获异常": "except Exception",
+                "虚拟环境": "python -m venv",
+                "格式化字符串": "f-string",
+                "排序字典": "sorted()",
+                "检查类型": "isinstance()",
+                "删除文件": "os.remove()",
+                "连接列表": "extend()",
+                "当前时间": "datetime.now()",
+            }
+            for key, ans in answers.items():
+                if key in question:
+                    return ans
+            return "不知道"
+
+        print("\n🔄 迭代 3: Agent v3 (全面进化)")
+        result3 = runner.run(agent_v3, train_cases)
+        runner.print_progress()
+
+        # 3.6 用验证集测试最佳版本
+        print("\n📊 用验证集测试最佳 Agent...")
+        val_result = runner.run(agent_v3, val_cases)
+        print(f"   验证集准确率: {val_result['accuracy']:.1%}")
+
+        # 3.7 输出进化摘要
+        frontier = runner.get_frontier()
+        print(f"\n🏆 最佳迭代: #{frontier['iteration']}，准确率: {frontier['accuracy']:.1%}")
+    else:
+        print("⚠️ benchmark_questions.json 不存在，跳过场景3")
 
     # ========================================
     # 汇总报告

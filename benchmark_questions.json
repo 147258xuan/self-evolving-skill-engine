@@ -1,0 +1,12 @@
+[
+  {"question": "Python 中如何反转列表？", "answer": "list.reverse() 或 list[::-1]"},
+  {"question": "Python 中如何读取 JSON 文件？", "answer": "json.load()"},
+  {"question": "Python 中如何捕获所有异常？", "answer": "except Exception"},
+  {"question": "Python 中如何创建虚拟环境？", "answer": "python -m venv"},
+  {"question": "Python 中如何格式化字符串？", "answer": "f-string"},
+  {"question": "Python 中如何排序字典？", "answer": "sorted() 或 dict.items()"},
+  {"question": "Python 中如何检查类型？", "answer": "isinstance()"},
+  {"question": "Python 中如何删除文件？", "answer": "os.remove()"},
+  {"question": "Python 中如何连接列表？", "answer": "extend() 或 +"},
+  {"question": "Python 中如何获取当前时间？", "answer": "datetime.now()"}
+]
