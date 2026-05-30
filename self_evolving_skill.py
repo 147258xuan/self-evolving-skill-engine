@@ -455,15 +455,32 @@ class SelfEvolvingSkillEngine:
         """阶段2: 符号验证器校验 (独立于LLM的确定性代码)"""
         rules = skill.fixed_core_rules
 
+        # 通用校验
+        if rules.get("max_retries", 0) < 0:
+            print("🚫 符号验证拦截: max_retries 不能为负数")
+            return False
+
+        if rules.get("timeout", 0) < 0:
+            print("🚫 符号验证拦截: timeout 不能为负数")
+            return False
+
         if rules.get("budget_limit", float("inf")) < 0:
             print("🚫 符号验证拦截: 预算限制不能为负数")
             return False
 
+        # 兼容旧的购物场景校验
         if "safety_color_ban" in rules:
             banned = rules["safety_color_ban"]
             if any(c in banned for c in rules.get("target_color", [])):
                 print(f"🚫 符号验证拦截: 目标颜色 {rules['target_color']} 在禁用列表 {banned} 中")
                 return False
+
+        # 代码修复场景校验
+        if "forbidden_imports" in rules:
+            print(f"🔒 禁止导入模块: {rules['forbidden_imports']}")
+
+        if rules.get("require_type_hints") == True:
+            print("🔒 要求: 修复代码必须包含类型提示")
 
         print("🛡️ 核心规则校验通过")
         return True
@@ -596,7 +613,7 @@ class SelfEvolvingSkillEngine:
 
 
 # ==========================================
-# 3. 运行演示
+# 3. 运行演示 — 代码 Bug 自动修复 & 技能生成
 # ==========================================
 
 if __name__ == "__main__":
@@ -605,62 +622,130 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("🚀 Self-Evolving Skill Engine v2.0")
     print("=" * 60)
-    print("新增功能:")
-    print("  🔄 回滚机制 — 修复导致回归时自动撤销")
-    print("  📦 失败记录保留 — 成功和失败的尝试都记录")
-    print("  🛡️ 评估逻辑隔离 — classify_failure 规则受校验和保护")
+    print("场景1: 代码 Bug 自动修复")
+    print("场景2: 技能生成 & 进化")
     print("=" * 60)
 
-    # Step 1: LLM 生成技能草案
-    draft_data = {
-        "name": "select_swim_gift_for_7yo_girl",
+    # ========================================
+    # 场景1: 代码 Bug 自动修复
+    # ========================================
+    print("\n" + "-" * 60)
+    print("📝 场景1: 代码 Bug 自动修复")
+    print("-" * 60)
+
+    # 1.1 生成「代码修复」技能
+    code_fix_skill = engine.generate_skill_draft({
+        "name": "python_bug_auto_fixer",
         "fixed_core_rules": {
-            "budget_limit": 200,
-            "safety_color_ban": ["blue", "white"],
-            "target_color": ["fluorescent_pink"],
+            "max_retries": 3,
+            "timeout": 30,
+            "forbidden_imports": ["os.system", "subprocess.Popen"],  # 安全约束
+            "require_type_hints": True,
         },
-        "steps": ["检索山姆三件套", "校验库存", "组合View泳镜", "下单"],
-    }
-    skill = engine.generate_skill_draft(draft_data)
+        "steps": [
+            "读取报错堆栈", "定位出错文件和行号",
+            "分析错误类型", "生成修复代码", "运行测试验证",
+        ],
+    })
 
-    if skill:
-        # Step 2: 符号验证器校验
-        is_valid = engine.validate_core_rules(skill)
+    if code_fix_skill:
+        engine.validate_core_rules(code_fix_skill)
 
-        if is_valid:
-            # Step 3: 模拟执行时发生【感知输出提取错误】
-            mock_error_signal = {"code": "SENSOR_NOISE", "message": "Size chart OCR_FAIL"}
-            failure_type = engine.classify_failure(mock_error_signal)
+        # 1.2 模拟: 运行时遇到 TypeError
+        print("\n💥 模拟: Agent 执行代码修复时遇到 TypeError...")
+        err = {"code": "KINEMATIC_LIMIT", "message": "TypeError: cannot unpack non-iterable NoneType object"}
+        ft = engine.classify_failure(err)
+        engine.auto_repair_and_update(
+            skill=code_fix_skill, failure_type=ft,
+            context={"file": "api_handler.py", "line": 42, "error": "TypeError", "traceback": "..."},
+        )
 
-            # Step 4: 调用 MIMO 生成修复方案并写入附录
-            engine.auto_repair_and_update(
-                skill=skill,
-                failure_type=failure_type,
-                context={"sku": "sam_mickey_001", "step_index": 1},
-            )
+        # 1.3 模拟: 又遇到导入安全问题
+        print("\n💥 模拟: Agent 生成的修复代码用了 os.system...")
+        err2 = {"code": "SAFETY_BOUNDARY_EXCEEDED", "message": "forbidden import: os.system"}
+        ft2 = engine.classify_failure(err2)
+        engine.auto_repair_and_update(
+            skill=code_fix_skill, failure_type=ft2,
+            context={"file": "utils.py", "line": 15, "blocked_import": "os.system"},
+        )
 
-            # Step 5: 模拟多次命中触发晋升检查
-            skill.dynamic_error_appendix[-1].hit_count = 5
-            engine.check_promotion_threshold(skill)
+        # 1.4 模拟: 修复后错误增多，触发回滚
+        print("\n💥 模拟: 修复后引入更多错误，触发回归检测...")
+        code_fix_skill.error_count = 10  # 模拟错误数增加
+        err3 = {"code": "TIMEOUT", "message": "test suite timeout after 30s"}
+        ft3 = engine.classify_failure(err3)
+        # 拍快照时错误数=10，修复后如果更高就回滚
+        engine.auto_repair_and_update(
+            skill=code_fix_skill, failure_type=ft3,
+            context={"file": "test_api.py", "error_count_before": 3, "error_count_after": 10},
+        )
 
-            # Step 6: 打印诊断报告
-            print("\n" + "=" * 60)
-            print("📊 诊断报告")
-            print("=" * 60)
-            report = engine.get_report(skill.skill_id)
-            for k, v in report.items():
-                print(f"  {k}: {v}")
+    # ========================================
+    # 场景2: 技能生成 & 进化
+    # ========================================
+    print("\n" + "-" * 60)
+    print("📝 场景2: 技能生成 & 进化")
+    print("-" * 60)
 
-    # 展示失败保留能力
+    # 2.1 从 LLM 输出生成新技能
+    api_skill = engine.generate_skill_draft({
+        "name": "api_data_fetcher",
+        "fixed_core_rules": {
+            "max_retries": 3,
+            "timeout": 10,
+            "rate_limit": "100/min",
+        },
+        "steps": [
+            "构建请求参数", "发送 HTTP 请求", "校验响应状态码",
+            "解析 JSON 响应", "提取目标字段", "返回结构化数据",
+        ],
+    })
+
+    if api_skill:
+        engine.validate_core_rules(api_skill)
+
+        # 2.2 模拟多次执行中遇到不同错误，技能逐步进化
+        errors = [
+            ({"code": "SENSOR_NOISE", "message": "OCR_FAIL on response field"},
+             {"api": "weather", "field": "temperature", "raw_value": "??°C"}),
+            ({"code": "ENTITY_NOT_FOUND", "message": "HALLUCINATION_DETECTED: field 'result' not in response"},
+             {"api": "stock", "response_keys": ["data", "meta", "ts"]}),
+            ({"code": "TIMEOUT", "message": "request timeout after 10s"},
+             {"api": "payment", "retry_count": 0}),
+            ({"code": "SENSOR_NOISE", "message": "OCR_FAIL parsing nested JSON"},
+             {"api": "order", "nested_depth": 3}),
+            ({"code": "SENSOR_NOISE", "message": "OCR_FAIL on decimal numbers"},
+             {"api": "price", "format": "¥1,234.56"}),
+        ]
+
+        for err_signal, ctx in errors:
+            ft = engine.classify_failure(err_signal)
+            engine.auto_repair_and_update(skill=api_skill, failure_type=ft, context=ctx)
+            api_skill.error_count += 1
+
+        # 2.3 晋升检查
+        print("\n" + "-" * 60)
+        print("📊 技能进化状态")
+        print("-" * 60)
+        for entry in api_skill.dynamic_error_appendix:
+            entry.hit_count = 5  # 模拟命中次数
+        engine.check_promotion_threshold(api_skill)
+
+    # ========================================
+    # 汇总报告
+    # ========================================
     print("\n" + "=" * 60)
-    print("📦 所有修复尝试记录 (包括成功和失败)")
+    print("📊 全局诊断报告")
     print("=" * 60)
-    for attempt in engine.fix_history:
-        print(f"  [{attempt.outcome.value}] {attempt.failure_type} → {attempt.fix_patch[:60]}...")
+    report = engine.get_report()
+    for k, v in report.items():
+        if isinstance(v, list):
+            print(f"  {k}:")
+            for item in v:
+                print(f"    - [{item['结果']}] {item['类型']}: {item['修复方案']}")
+        else:
+            print(f"  {k}: {v}")
 
-    # 展示评估规则完整性
     print("\n" + "=" * 60)
-    print("🛡️ 评估规则完整性检查")
+    print("🛡️ 评估规则完整性: " + ("✅ 通过" if engine.rules_guard.verify_integrity() else "❌ 被篡改!"))
     print("=" * 60)
-    print(f"  规则文件: {engine.rules_guard.rules_path}")
-    print(f"  校验通过: {engine.rules_guard.verify_integrity()}")
