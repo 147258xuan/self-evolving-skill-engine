@@ -276,7 +276,7 @@ class SelfEvolvingSkillEngine:
     # 回归检测阈值：修复后错误数超过此倍数则触发回滚
     REGRESSION_MULTIPLIER = 1.5
     # 最少需要多少次错误才能触发回归检测（避免冷启动误判）
-    MIN_ERRORS_FOR_REGRESSION = 3
+    MIN_ERRORS_FOR_REGRESSION = 1
 
     def __init__(self, data_dir: Optional[Path] = None):
         self.data_dir = data_dir or DATA_DIR
@@ -428,6 +428,63 @@ class SelfEvolvingSkillEngine:
             print(f"🚨 回归检测: 错误数 {before} → {after} (>{self.REGRESSION_MULTIPLIER}x)")
             return True
         return False
+
+    # ---------- [新增] 执行 & 错误计数 ----------
+
+    def execute_and_count_errors(self, skill: Skill, results: List[dict]) -> int:
+        """
+        执行后统计错误数，自动更新 skill.error_count。
+
+        调用方式：
+          results = [
+            {"name": "test_login", "passed": True},
+            {"name": "test_payment", "passed": False, "error": "timeout"},
+            {"name": "test_refund", "passed": False, "error": "assertion failed"},
+          ]
+          error_count = engine.execute_and_count_errors(skill, results)
+
+        参数:
+            skill: 目标技能
+            results: 执行结果列表，每项包含:
+                - name: 测试/步骤名称
+                - passed: 是否通过 (True/False)
+                - error: 失败原因 (可选)
+                - severity: 严重级别 (可选, 默认 "error", 可选 "warning"/"critical")
+
+        返回:
+            错误总数
+        """
+        errors = [r for r in results if not r.get("passed", True)]
+        warnings = [r for r in results if r.get("severity") == "warning" and not r.get("passed", True)]
+        criticals = [r for r in results if r.get("severity") == "critical" and not r.get("passed", True)]
+
+        # critical 算 2 分，error 算 1 分，warning 算 0.5 分
+        error_count = len(criticals) * 2 + (len(errors) - len(criticals)) * 1 + len(warnings) * 0.5
+        error_count = int(error_count)
+
+        # 更新技能错误计数
+        old_count = skill.error_count
+        skill.error_count = error_count
+
+        # 输出统计
+        total = len(results)
+        passed = total - len(errors)
+        print(f"\n📊 执行结果统计 [{skill.name}]:")
+        print(f"   总计: {total} | 通过: {passed} | 失败: {len(errors)}")
+        if criticals:
+            print(f"   🔴 严重: {len(criticals)} — {[r['name'] for r in criticals]}")
+        if errors:
+            normal_errors = [r for r in errors if r.get('severity', 'error') == 'error']
+            if normal_errors:
+                print(f"   ❌ 错误: {len(normal_errors)} — {[r['name'] for r in normal_errors]}")
+        if warnings:
+            print(f"   ⚠️ 警告: {len(warnings)} — {[r['name'] for r in warnings]}")
+        print(f"   错误分数: {old_count} → {error_count}")
+
+        # 持久化
+        self._save_skill(skill)
+
+        return error_count
 
     # ---------- 阶段1: 生成 ----------
 
@@ -651,17 +708,35 @@ if __name__ == "__main__":
     if code_fix_skill:
         engine.validate_core_rules(code_fix_skill)
 
-        # 1.2 模拟: 运行时遇到 TypeError
-        print("\n💥 模拟: Agent 执行代码修复时遇到 TypeError...")
+        # 1.2 模拟: 运行测试，发现3个错误
+        print("\n💥 模拟: Agent 修复后运行测试...")
+        test_results_1 = [
+            {"name": "test_type_hints", "passed": True},
+            {"name": "test_import_safety", "passed": True},
+            {"name": "test_basic_run", "passed": False, "error": "TypeError: cannot unpack non-iterable NoneType"},
+            {"name": "test_edge_case", "passed": False, "error": "KeyError: 'result'"},
+            {"name": "test_timeout", "passed": False, "error": "timeout after 30s", "severity": "warning"},
+        ]
+        engine.execute_and_count_errors(code_fix_skill, test_results_1)
+
         err = {"code": "KINEMATIC_LIMIT", "message": "TypeError: cannot unpack non-iterable NoneType object"}
         ft = engine.classify_failure(err)
         engine.auto_repair_and_update(
             skill=code_fix_skill, failure_type=ft,
-            context={"file": "api_handler.py", "line": 42, "error": "TypeError", "traceback": "..."},
+            context={"file": "api_handler.py", "line": 42, "error": "TypeError"},
         )
 
-        # 1.3 模拟: 又遇到导入安全问题
-        print("\n💥 模拟: Agent 生成的修复代码用了 os.system...")
+        # 1.3 模拟: 又遇到导入安全问题，但测试结果改善
+        print("\n💥 模拟: Agent 修复后再次测试...")
+        test_results_2 = [
+            {"name": "test_type_hints", "passed": True},
+            {"name": "test_import_safety", "passed": False, "error": "forbidden import: os.system", "severity": "critical"},
+            {"name": "test_basic_run", "passed": True},
+            {"name": "test_edge_case", "passed": True},
+            {"name": "test_timeout", "passed": True},
+        ]
+        engine.execute_and_count_errors(code_fix_skill, test_results_2)
+
         err2 = {"code": "SAFETY_BOUNDARY_EXCEEDED", "message": "forbidden import: os.system"}
         ft2 = engine.classify_failure(err2)
         engine.auto_repair_and_update(
@@ -669,16 +744,23 @@ if __name__ == "__main__":
             context={"file": "utils.py", "line": 15, "blocked_import": "os.system"},
         )
 
-        # 1.4 模拟: 修复后错误增多，触发回滚
-        print("\n💥 模拟: 修复后引入更多错误，触发回归检测...")
-        code_fix_skill.error_count = 10  # 模拟错误数增加
-        err3 = {"code": "TIMEOUT", "message": "test suite timeout after 30s"}
-        ft3 = engine.classify_failure(err3)
-        # 拍快照时错误数=10，修复后如果更高就回滚
-        engine.auto_repair_and_update(
-            skill=code_fix_skill, failure_type=ft3,
-            context={"file": "test_api.py", "error_count_before": 3, "error_count_after": 10},
-        )
+        # 1.4 模拟: 修复后测试全崩了！触发回滚
+        print("\n💥 模拟: Agent 激进修复后测试全崩，触发回滚...")
+        # 先拍快照（此时错误数=2，是上次修复后的状态）
+        snapshot_before = engine._take_snapshot(code_fix_skill)
+        # 再执行测试，错误数飙升到 7
+        test_results_3 = [
+            {"name": "test_type_hints", "passed": False, "error": "SyntaxError", "severity": "critical"},
+            {"name": "test_import_safety", "passed": False, "error": "ImportError", "severity": "critical"},
+            {"name": "test_basic_run", "passed": False, "error": "crash"},
+            {"name": "test_edge_case", "passed": False, "error": "crash"},
+            {"name": "test_timeout", "passed": False, "error": "crash"},
+        ]
+        engine.execute_and_count_errors(code_fix_skill, test_results_3)
+        # 回归检测：错误数 2 → 7，触发回滚！
+        if engine._detect_regression(code_fix_skill, snapshot_before):
+            code_fix_skill = engine._rollback(code_fix_skill, snapshot_before)
+            print("✅ 回滚成功！技能恢复到修复前状态")
 
     # ========================================
     # 场景2: 技能生成 & 进化
@@ -707,21 +789,26 @@ if __name__ == "__main__":
         # 2.2 模拟多次执行中遇到不同错误，技能逐步进化
         errors = [
             ({"code": "SENSOR_NOISE", "message": "OCR_FAIL on response field"},
-             {"api": "weather", "field": "temperature", "raw_value": "??°C"}),
+             {"api": "weather", "field": "temperature", "raw_value": "??°C"},
+             [{"name": "test_parse", "passed": True}, {"name": "test_field", "passed": False, "error": "OCR_FAIL"}]),
             ({"code": "ENTITY_NOT_FOUND", "message": "HALLUCINATION_DETECTED: field 'result' not in response"},
-             {"api": "stock", "response_keys": ["data", "meta", "ts"]}),
+             {"api": "stock", "response_keys": ["data", "meta", "ts"]},
+             [{"name": "test_parse", "passed": True}, {"name": "test_field", "passed": False, "error": "missing field"}, {"name": "test_schema", "passed": False, "error": "schema mismatch"}]),
             ({"code": "TIMEOUT", "message": "request timeout after 10s"},
-             {"api": "payment", "retry_count": 0}),
+             {"api": "payment", "retry_count": 0},
+             [{"name": "test_parse", "passed": False, "error": "timeout", "severity": "critical"}, {"name": "test_field", "passed": False, "error": "timeout"}, {"name": "test_schema", "passed": False, "error": "timeout"}]),
             ({"code": "SENSOR_NOISE", "message": "OCR_FAIL parsing nested JSON"},
-             {"api": "order", "nested_depth": 3}),
+             {"api": "order", "nested_depth": 3},
+             [{"name": "test_parse", "passed": True}, {"name": "test_nested", "passed": False, "error": "OCR_FAIL"}]),
             ({"code": "SENSOR_NOISE", "message": "OCR_FAIL on decimal numbers"},
-             {"api": "price", "format": "¥1,234.56"}),
+             {"api": "price", "format": "¥1,234.56"},
+             [{"name": "test_parse", "passed": True}, {"name": "test_decimal", "passed": False, "error": "format error"}]),
         ]
 
-        for err_signal, ctx in errors:
+        for err_signal, ctx, test_results in errors:
+            engine.execute_and_count_errors(api_skill, test_results)
             ft = engine.classify_failure(err_signal)
             engine.auto_repair_and_update(skill=api_skill, failure_type=ft, context=ctx)
-            api_skill.error_count += 1
 
         # 2.3 晋升检查
         print("\n" + "-" * 60)
